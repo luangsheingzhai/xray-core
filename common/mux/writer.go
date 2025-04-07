@@ -78,9 +78,17 @@ func writeMetaWithFrame(writer buf.Writer, meta FrameMetadata, data buf.MultiBuf
 	if _, err := serial.WriteUint16(frame, uint16(data.Len())); err != nil {
 		return err
 	}
-
 	mb2 := make(buf.MultiBuffer, 0, len(data)+1)
 	mb2 = append(mb2, frame)
+	for _, b := range data {
+		if frame.Len() + b.Len() < buf.Size {
+			frame.Write(b.Bytes())
+			b.Release()
+			b = nil
+		} else {
+			break;
+		}
+	}
 	mb2 = append(mb2, data...)
 	return writer.WriteMultiBuffer(mb2)
 }
