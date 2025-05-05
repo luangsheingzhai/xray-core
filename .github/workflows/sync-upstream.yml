@@ -1,0 +1,51 @@
+name: Upstream Sync
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+
+jobs:
+  sync_latest_from_upstream:
+    name: Sync latest commits from upstream repo
+    runs-on: ubuntu-latest
+    if: ${{ github.event.repository.fork }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Sync upstream changes
+        id: sync
+        uses: aormsby/Fork-Sync-With-Upstream-action@v3.4
+        with:
+          upstream_sync_repo: XTLS/Xray-core
+          upstream_sync_branch: main
+          target_sync_branch: main
+          target_repo_token: ${{ secrets.GITHUB_TOKEN }}
+          test_mode: false
+
+  sync_latest_tag:
+    name: Sync latest tags from upstream repo
+    runs-on: ubuntu-latest
+    if: ${{ github.event.repository.fork }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure Git
+        run: |
+          git config --global user.name "GH Action - Upstream Sync"
+          git config --global user.email "action@github.com"
+
+      - name: Add upstream repository
+        run: |
+          git remote add upstream https://github.com/XTLS/Xray-core.git
+          git fetch upstream --recurse-submodules=no --progress --prune --tags
+
+      - name: Sync tags
+        run: |
+          git push origin --tags
