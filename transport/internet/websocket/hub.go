@@ -108,7 +108,6 @@ func (h *requestHandler) ServeHTTP(writer http.ResponseWriter, request *http.Req
 	conn, err := upgrader.Upgrade(writer, request, responseHeader)
 	if err != nil {
 		errors.LogInfoInner(context.Background(), err, "failed to convert to WebSocket connection")
-		notFoundHandler(writer)
 		return
 	}
 
