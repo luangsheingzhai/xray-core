@@ -7,11 +7,14 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/xtls/xray-core/common/crypto"
 	"github.com/xtls/xray-core/common/errors"
+	"golang.org/x/crypto/chacha20poly1305"
 	"lukechampine.com/blake3"
 )
 
@@ -23,20 +26,21 @@ var OutBytesPool = sync.Pool{
 
 type CommonConn struct {
 	net.Conn
+	UseAES      bool
 	Client      *ClientInstance
 	UnitedKey   []byte
 	PreWrite    []byte
-	GCM         *GCM
-	PeerGCM     *GCM
+	AEAD        *AEAD
+	PeerAEAD    *AEAD
 	PeerPadding []byte
-	PeerInBytes []byte
-	PeerCache   []byte
+	rawInput    bytes.Buffer
+	input       bytes.Reader
 }
 
-func NewCommonConn(conn net.Conn) *CommonConn {
+func NewCommonConn(conn net.Conn, useAES bool) *CommonConn {
 	return &CommonConn{
-		Conn:        conn,
-		PeerInBytes: make([]byte, 5+17000), // no need to use sync.Pool, because we are always reading
+		Conn:   conn,
+		UseAES: useAES,
 	}
 }
 
@@ -55,12 +59,12 @@ func (c *CommonConn) Write(b []byte) (int, error) {
 		headerAndData := outBytes[:5+len(b)+16]
 		EncodeHeader(headerAndData, len(b)+16)
 		max := false
-		if bytes.Equal(c.GCM.Nonce[:], MaxNonce) {
+		if bytes.Equal(c.AEAD.Nonce[:], MaxNonce) {
 			max = true
 		}
-		c.GCM.Seal(headerAndData[:5], nil, b, headerAndData[:5])
+		c.AEAD.Seal(headerAndData[:5], nil, b, headerAndData[:5])
 		if max {
-			c.GCM = NewGCM(headerAndData, c.UnitedKey)
+			c.AEAD = NewAEAD(headerAndData, c.UnitedKey, c.UseAES)
 		}
 		if c.PreWrite != nil {
 			headerAndData = append(c.PreWrite, headerAndData...)
@@ -77,12 +81,12 @@ func (c *CommonConn) Read(b []byte) (int, error) {
 	if len(b) == 0 {
 		return 0, nil
 	}
-	if c.PeerGCM == nil { // client's 0-RTT
+	if c.PeerAEAD == nil { // client's 0-RTT
 		serverRandom := make([]byte, 16)
 		if _, err := io.ReadFull(c.Conn, serverRandom); err != nil {
 			return 0, err
 		}
-		c.PeerGCM = NewGCM(serverRandom, c.UnitedKey)
+		c.PeerAEAD = NewAEAD(serverRandom, c.UnitedKey, c.UseAES)
 		if xorConn, ok := c.Conn.(*XorConn); ok {
 			xorConn.PeerCTR = NewCTR(c.UnitedKey, serverRandom)
 		}
@@ -91,21 +95,19 @@ func (c *CommonConn) Read(b []byte) (int, error) {
 		if _, err := io.ReadFull(c.Conn, c.PeerPadding); err != nil {
 			return 0, err
 		}
-		if _, err := c.PeerGCM.Open(c.PeerPadding[:0], nil, c.PeerPadding, nil); err != nil {
+		if _, err := c.PeerAEAD.Open(c.PeerPadding[:0], nil, c.PeerPadding, nil); err != nil {
 			return 0, err
 		}
 		c.PeerPadding = nil
 	}
-	if len(c.PeerCache) > 0 {
-		n := copy(b, c.PeerCache)
-		c.PeerCache = c.PeerCache[n:]
-		return n, nil
+	if c.input.Len() > 0 {
+		return c.input.Read(b)
 	}
-	peerHeader := c.PeerInBytes[:5]
-	if _, err := io.ReadFull(c.Conn, peerHeader); err != nil {
+	peerHeader := [5]byte{}
+	if _, err := io.ReadFull(c.Conn, peerHeader[:]); err != nil {
 		return 0, err
 	}
-	l, err := DecodeHeader(c.PeerInBytes[:5]) // l: 17~17000
+	l, err := DecodeHeader(peerHeader[:]) // l: 17~17000
 	if err != nil {
 		if c.Client != nil && strings.Contains(err.Error(), "invalid header: ") { // client's 0-RTT
 			c.Client.RWLock.Lock()
@@ -118,7 +120,10 @@ func (c *CommonConn) Read(b []byte) (int, error) {
 		return 0, err
 	}
 	c.Client = nil
-	peerData := c.PeerInBytes[5 : 5+l]
+	if c.rawInput.Cap() < l {
+		c.rawInput.Grow(l) // no need to use sync.Pool, because we are always reading
+	}
+	peerData := c.rawInput.Bytes()[:l]
 	if _, err := io.ReadFull(c.Conn, peerData); err != nil {
 		return 0, err
 	}
@@ -126,46 +131,50 @@ func (c *CommonConn) Read(b []byte) (int, error) {
 	if len(dst) <= len(b) {
 		dst = b[:len(dst)] // avoids another copy()
 	}
-	var newGCM *GCM
-	if bytes.Equal(c.PeerGCM.Nonce[:], MaxNonce) {
-		newGCM = NewGCM(c.PeerInBytes[:5+l], c.UnitedKey)
+	var newAEAD *AEAD
+	if bytes.Equal(c.PeerAEAD.Nonce[:], MaxNonce) {
+		newAEAD = NewAEAD(append(peerHeader[:], peerData...), c.UnitedKey, c.UseAES)
 	}
-	_, err = c.PeerGCM.Open(dst[:0], nil, peerData, peerHeader)
-	if newGCM != nil {
-		c.PeerGCM = newGCM
+	_, err = c.PeerAEAD.Open(dst[:0], nil, peerData, peerHeader[:])
+	if newAEAD != nil {
+		c.PeerAEAD = newAEAD
 	}
 	if err != nil {
 		return 0, err
 	}
 	if len(dst) > len(b) {
-		c.PeerCache = dst[copy(b, dst):]
+		c.input.Reset(dst[copy(b, dst):])
 		dst = b // for len(dst)
 	}
 	return len(dst), nil
 }
 
-type GCM struct {
+type AEAD struct {
 	cipher.AEAD
 	Nonce [12]byte
 }
 
-func NewGCM(ctx, key []byte) *GCM {
+func NewAEAD(ctx, key []byte, useAES bool) *AEAD {
 	k := make([]byte, 32)
 	blake3.DeriveKey(k, string(ctx), key)
-	block, _ := aes.NewCipher(k)
-	aead, _ := cipher.NewGCM(block)
-	return &GCM{AEAD: aead}
-	//chacha20poly1305.New()
+	var aead cipher.AEAD
+	if useAES {
+		block, _ := aes.NewCipher(k)
+		aead, _ = cipher.NewGCM(block)
+	} else {
+		aead, _ = chacha20poly1305.New(k)
+	}
+	return &AEAD{AEAD: aead}
 }
 
-func (a *GCM) Seal(dst, nonce, plaintext, additionalData []byte) []byte {
+func (a *AEAD) Seal(dst, nonce, plaintext, additionalData []byte) []byte {
 	if nonce == nil {
 		nonce = IncreaseNonce(a.Nonce[:])
 	}
 	return a.AEAD.Seal(dst, nonce, plaintext, additionalData)
 }
 
-func (a *GCM) Open(dst, nonce, ciphertext, additionalData []byte) ([]byte, error) {
+func (a *AEAD) Open(dst, nonce, ciphertext, additionalData []byte) ([]byte, error) {
 	if nonce == nil {
 		nonce = IncreaseNonce(a.Nonce[:])
 	}
@@ -206,7 +215,66 @@ func DecodeHeader(h []byte) (l int, err error) {
 		l = 0
 	}
 	if l < 17 || l > 17000 { // TODO: TLSv1.3 max length
-		err = errors.New("invalid header: ", fmt.Sprintf("%v", h[:5])) // DO NOT CHANGE: relied by client's Read()
+		err = errors.New("invalid header: " + fmt.Sprintf("%v", h[:5])) // DO NOT CHANGE: relied by client's Read()
+	}
+	return
+}
+
+func ParsePadding(padding string, paddingLens, paddingGaps *[][3]int) (err error) {
+	if padding == "" {
+		return
+	}
+	maxLen := 0
+	for i, s := range strings.Split(padding, ".") {
+		x := strings.Split(s, "-")
+		if len(x) < 3 || x[0] == "" || x[1] == "" || x[2] == "" {
+			return errors.New("invalid padding lenth/gap parameter: " + s)
+		}
+		y := [3]int{}
+		if y[0], err = strconv.Atoi(x[0]); err != nil {
+			return
+		}
+		if y[1], err = strconv.Atoi(x[1]); err != nil {
+			return
+		}
+		if y[2], err = strconv.Atoi(x[2]); err != nil {
+			return
+		}
+		if i == 0 && (y[0] < 100 || y[1] < 18+17 || y[2] < 18+17) {
+			return errors.New("first padding length must not be smaller than 35")
+		}
+		if i%2 == 0 {
+			*paddingLens = append(*paddingLens, y)
+			maxLen += max(y[1], y[2])
+		} else {
+			*paddingGaps = append(*paddingGaps, y)
+		}
+	}
+	if maxLen > 18+65535 {
+		return errors.New("total padding length must not be larger than 65553")
+	}
+	return
+}
+
+func CreatPadding(paddingLens, paddingGaps [][3]int) (length int, lens []int, gaps []time.Duration) {
+	if len(paddingLens) == 0 {
+		paddingLens = [][3]int{{100, 111, 1111}, {50, 0, 3333}}
+		paddingGaps = [][3]int{{75, 0, 111}}
+	}
+	for _, y := range paddingLens {
+		l := 0
+		if y[0] >= int(crypto.RandBetween(0, 100)) {
+			l = int(crypto.RandBetween(int64(y[1]), int64(y[2])))
+		}
+		lens = append(lens, l)
+		length += l
+	}
+	for _, y := range paddingGaps {
+		g := 0
+		if y[0] >= int(crypto.RandBetween(0, 100)) {
+			g = int(crypto.RandBetween(int64(y[1]), int64(y[2])))
+		}
+		gaps = append(gaps, time.Duration(g)*time.Millisecond)
 	}
 	return
 }

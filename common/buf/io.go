@@ -24,47 +24,46 @@ var ErrReadTimeout = errors.New("IO timeout")
 
 // TimeoutReader is a reader that returns error if Read() operation takes longer than the given timeout.
 type TimeoutReader interface {
+	Reader
 	ReadMultiBufferTimeout(time.Duration) (MultiBuffer, error)
 }
 
-type OnceTimeoutReader struct {
-	reader Reader
-	called bool
-	mb     MultiBuffer
-	err    error
-	done   chan struct{}
+type TimeoutWrapperReader struct {
+	Reader
+	mb   MultiBuffer
+	err  error
+	done chan struct{}
 }
 
-func NewOnceTimeoutReader(reader Reader) *OnceTimeoutReader {
-	return &OnceTimeoutReader{
-		reader: reader,
-		done:   make(chan struct{}),
-	}
-}
-
-func (r *OnceTimeoutReader) ReadMultiBuffer() (MultiBuffer, error) {
-	if r.called {
+func (r *TimeoutWrapperReader) ReadMultiBuffer() (MultiBuffer, error) {
+	if r.done != nil {
 		<-r.done
-		r.called = false
+		r.done = nil
 		return r.mb, r.err
 	}
 	r.mb = nil
 	r.err = nil
-	return r.reader.ReadMultiBuffer()
+	return r.Reader.ReadMultiBuffer()
 }
 
-func (r *OnceTimeoutReader) ReadMultiBufferTimeout(duration time.Duration) (MultiBuffer, error) {
-	r.called = true
+func (r *TimeoutWrapperReader) ReadMultiBufferTimeout(duration time.Duration) (MultiBuffer, error) {
+	if r.done == nil {
+		r.done = make(chan struct{})
+		go func() {
+			r.mb, r.err = r.Reader.ReadMultiBuffer()
+			close(r.done)
+		}()
+	}
+	timeout := make(chan struct{})
 	go func() {
-		r.mb, r.err = r.reader.ReadMultiBuffer()
-		close(r.done) // panic if more than once
+		time.Sleep(duration)
+		close(timeout)
 	}()
-	time.Sleep(duration)
 	select {
 	case <-r.done:
-		r.called = false
+		r.done = nil
 		return r.mb, r.err
-	default:
+	case <-timeout:
 		return nil, nil
 	}
 }
