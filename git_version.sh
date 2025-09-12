@@ -24,7 +24,7 @@ COMMIT_HASH=$(git rev-parse --short=12 HEAD)
 echo "提交哈希值: $COMMIT_HASH"
 
 # 组装成伪版本号
-PSEUDO_VERSION="v1.250803.1-0.${COMMIT_TIMESTAMP}-${COMMIT_HASH}"
+PSEUDO_VERSION="v1.250911.1-0.${COMMIT_TIMESTAMP}-${COMMIT_HASH}"
 echo "完整伪版本号: $PSEUDO_VERSION"
 
 echo ""
